@@ -29,9 +29,8 @@ EXIF 载荷以 b"Exif\\x00\\x00" 开头，其后是 TIFF 子集：
 
 from __future__ import annotations
 
-import hashlib
-import re
 import struct
+from fractions import Fraction
 
 
 MAGIC = b"SEGX"
@@ -39,167 +38,733 @@ VERSION = 1
 TRAILER_MARKER = 0xFFD9
 EXIF_PREFIX = b"Exif\x00\x00"
 
+EXIF_SEGMENT_MARKER = 0xE1
+
+TYPE_BYTE = 1
+TYPE_ASCII = 2
+TYPE_SHORT = 3
+TYPE_LONG = 4
+TYPE_RATIONAL = 5
+
+TYPE_SIZE = {
+    TYPE_BYTE: 1,
+    TYPE_ASCII: 1,
+    TYPE_SHORT: 2,
+    TYPE_LONG: 4,
+    TYPE_RATIONAL: 8,
+}
+
+GPS_INFO = 0x8825
+MAKE = 0x010F
+MODEL = 0x0110
+ORIENTATION = 0x0112
+IMAGE_DESCRIPTION = 0x010E
+SOFTWARE = 0x0131
+COMPRESSION = 0x0103
+THUMB_OFFSET = 0x0201
+THUMB_LENGTH = 0x0202
+GPS_LAT_REF = 0x0001
+GPS_LAT = 0x0002
+GPS_LON_REF = 0x0003
+GPS_LON = 0x0004
+
+TAG_NAMES = {
+    MAKE: "Make",
+    MODEL: "Model",
+    ORIENTATION: "Orientation",
+    IMAGE_DESCRIPTION: "ImageDescription",
+    SOFTWARE: "Software",
+    GPS_INFO: "GPSInfo",
+    GPS_LAT_REF: "GPSLatitudeRef",
+    GPS_LAT: "GPSLatitude",
+    GPS_LON_REF: "GPSLongitudeRef",
+    GPS_LON: "GPSLongitude",
+    COMPRESSION: "Compression",
+    THUMB_OFFSET: "JPEGInterchangeFormat",
+    THUMB_LENGTH: "JPEGInterchangeFormatLength",
+}
+
+TAG_IDS = {name: tag for tag, name in TAG_NAMES.items()}
+
+# 指针类标签始终以单个 LONG 内联值保存。
+_POINTER_TAGS = (GPS_INFO, THUMB_OFFSET, THUMB_LENGTH)
+
+
+def _align2(value: int) -> int:
+    return (value + 1) & ~1
+
+
+def _order(endian: str) -> str:
+    if endian == "M":
+        return ">"
+    if endian == "I":
+        return "<"
+    raise ValueError("unknown byte order")
+
+
+# ---------------------------------------------------------------------------
+# SEGX 容器
+# ---------------------------------------------------------------------------
+
 
 def iter_segments(data: bytes) -> list[dict]:
-    """按 SEGX 容器格式解析全部图像段。
+    """按 SEGX 容器格式解析全部图像段。"""
 
-    文件头为 8 字节，段头为 2 字节标记加 4 字节长度。标记和长度必须按文件头
-    第 6 字节声明的字节序解释：b"M" 为大端，b"I" 为小端；不能固定按大端读取。
-    长度字段只表示载荷字节数，不包含 6 字节段头。段偏移以文件起点为 0。
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("image data must be bytes")
+    data = bytes(data)
+    if len(data) < 8:
+        raise ValueError("truncated SEGX header")
+    if data[:4] != MAGIC:
+        raise ValueError("bad SEGX magic")
+    if data[4] != VERSION:
+        raise ValueError("unsupported SEGX version")
+    try:
+        endian = data[5:6].decode("ascii")
+        bo = _order(endian)
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("unknown byte order") from None
 
-    返回列表中的每个字典恰好包含：
-        marker: int，段标记；
-        length: int，载荷长度；
-        offset: int，段头首字节的绝对偏移；
-        payload_offset: int，载荷首字节的绝对偏移，等于 offset 加 6；
-        payload: bytes，段载荷本身。
-    终止段 0xFFD9 不返回，紧跟在终止段之后的任何字节都视为损坏。
-
-    遇到以下情况抛出 ValueError：输入短于文件头、魔数或版本错误、字节序标志
-    未知、段头被截断、长度越过文件末尾、终止段缺失或长度非零、终止段后仍有
-    数据、同一文件出现多个终止段。空段列表是合法的。
-
-    该函数必须返回所有段，不能只返回第一段；后续 find_exif 依赖完整列表。
-    """
-
-    raise NotImplementedError
+    segments: list[dict] = []
+    position = 8
+    total = len(data)
+    while True:
+        if position == total:
+            raise ValueError("missing SEGX trailer")
+        if position + 6 > total:
+            raise ValueError("truncated segment header")
+        marker, length = struct.unpack_from(bo + "HI", data, position)
+        if marker == TRAILER_MARKER:
+            if length != 0:
+                raise ValueError("trailer segment has non-zero length")
+            position += 6
+            if position != total:
+                raise ValueError("data present after SEGX trailer")
+            break
+        payload_start = position + 6
+        payload_end = payload_start + length
+        if payload_end > total:
+            raise ValueError("truncated segment payload")
+        segments.append(
+            {
+                "marker": marker,
+                "length": length,
+                "offset": position,
+                "payload_offset": payload_start,
+                "payload": data[payload_start:payload_end],
+            }
+        )
+        position = payload_end
+    return segments
 
 
 def find_exif(segments: list[dict]) -> list[int]:
-    """返回所有 EXIF 元数据段在 segments 中的下标，支持零个或多个元数据段。
+    """返回所有 EXIF 元数据段在 segments 中的下标，支持零个或多个元数据段。"""
 
-    判定条件必须同时满足：marker 等于 0xE1，且 payload 以 b"Exif\\x00\\x00"
-    开头。不能假设 EXIF 位于固定下标或固定文件偏移。返回下标按 segments 的
-    原始顺序排列；没有元数据时返回空列表。
+    indexes: list[int] = []
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError("segment must be a mapping")
+        if "marker" not in segment or "payload" not in segment:
+            raise ValueError("segment missing marker or payload")
+        payload = segment["payload"]
+        if segment["marker"] == EXIF_SEGMENT_MARKER and payload.startswith(EXIF_PREFIX):
+            indexes.append(index)
+    return indexes
 
-    参数 segments 必须是 iter_segments 的返回值。若某个字典缺少 marker 或
-    payload 字段，抛出 ValueError。
-    """
 
-    raise NotImplementedError
+# ---------------------------------------------------------------------------
+# TIFF 读取
+# ---------------------------------------------------------------------------
+
+
+def _u16(data: bytes, offset: int, bo: str) -> int:
+    return struct.unpack_from(bo + "H", data, offset)[0]
+
+
+def _u32(data: bytes, offset: int, bo: str) -> int:
+    return struct.unpack_from(bo + "I", data, offset)[0]
+
+
+def _read_ifd(tiff: bytes, offset: int, bo: str) -> tuple[list[dict], int]:
+    size = len(tiff)
+    if offset < 8 or offset + 2 > size:
+        raise ValueError("IFD offset out of bounds")
+    count = _u16(tiff, offset, bo)
+    table_end = offset + 2 + 12 * count
+    if table_end + 4 > size:
+        raise ValueError("IFD table runs past TIFF end")
+    entries: list[dict] = []
+    for index in range(count):
+        entry_offset = offset + 2 + 12 * index
+        tag, value_type, item_count = struct.unpack_from(bo + "HHI", tiff, entry_offset)
+        element_size = TYPE_SIZE.get(value_type)
+        if element_size is None:
+            raise ValueError("unknown TIFF type")
+        total = element_size * item_count
+        if total <= 4:
+            raw = tiff[entry_offset + 8 : entry_offset + 8 + total]
+        else:
+            value_offset = _u32(tiff, entry_offset + 8, bo)
+            if value_offset < 8 or value_offset + total > size:
+                raise ValueError("value offset out of bounds")
+            raw = tiff[value_offset : value_offset + total]
+        entries.append(
+            {
+                "tag": tag,
+                "type": value_type,
+                "count": item_count,
+                "raw": raw,
+            }
+        )
+    next_offset = _u32(tiff, table_end, bo)
+    if next_offset and (next_offset < 8 or next_offset + 2 > size):
+        raise ValueError("next IFD offset out of bounds")
+    return entries, next_offset
+
+
+def _find_entry(entries: list[dict] | None, tag: int) -> dict | None:
+    if entries is None:
+        return None
+    for entry in entries:
+        if entry["tag"] == tag:
+            return entry
+    return None
+
+
+def _entry_int(entry: dict, bo: str) -> int:
+    if entry["type"] == TYPE_LONG and entry["count"] >= 1:
+        return struct.unpack_from(bo + "I", entry["raw"], 0)[0]
+    if entry["type"] == TYPE_SHORT and entry["count"] >= 1:
+        return struct.unpack_from(bo + "H", entry["raw"], 0)[0]
+    if entry["type"] == TYPE_BYTE and entry["count"] >= 1:
+        return entry["raw"][0]
+    raise ValueError("entry is not an integer value")
+
+
+def _decode_entry(entry: dict, bo: str):
+    value_type = entry["type"]
+    count = entry["count"]
+    raw = entry["raw"]
+    if value_type == TYPE_ASCII:
+        return raw.split(b"\x00", 1)[0].decode("ascii")
+    if value_type == TYPE_BYTE:
+        return tuple(raw[:count])
+    if value_type == TYPE_SHORT:
+        return struct.unpack(bo + "H" * count, raw[: 2 * count])
+    if value_type == TYPE_LONG:
+        return struct.unpack(bo + "I" * count, raw[: 4 * count])
+    if value_type == TYPE_RATIONAL:
+        numbers = struct.unpack(bo + "I" * (count * 2), raw[: 8 * count])
+        return tuple(zip(numbers[0::2], numbers[1::2]))
+    raise ValueError("unsupported TIFF type")
+
+
+def _parse_exif(payload: bytes) -> dict:
+    if not isinstance(payload, (bytes, bytearray)):
+        raise ValueError("EXIF payload must be bytes")
+    payload = bytes(payload)
+    if not payload.startswith(EXIF_PREFIX):
+        raise ValueError("missing EXIF prefix")
+    tiff = payload[len(EXIF_PREFIX) :]
+    if len(tiff) < 8:
+        raise ValueError("truncated TIFF header")
+    if tiff[:2] == b"MM":
+        endian = "M"
+    elif tiff[:2] == b"II":
+        endian = "I"
+    else:
+        raise ValueError("bad TIFF byte order")
+    bo = _order(endian)
+    if _u16(tiff, 2, bo) != 42:
+        raise ValueError("bad TIFF magic")
+    ifd0_offset = _u32(tiff, 4, bo)
+    visited = {ifd0_offset}
+    ifd0, next0 = _read_ifd(tiff, ifd0_offset, bo)
+
+    gps = None
+    pointer = _find_entry(ifd0, GPS_INFO)
+    if pointer is not None:
+        gps_offset = _entry_int(pointer, bo)
+        if gps_offset in visited:
+            raise ValueError("IFD loop detected")
+        visited.add(gps_offset)
+        gps, gps_next = _read_ifd(tiff, gps_offset, bo)
+        if gps_next != 0:
+            raise ValueError("GPS IFD must terminate")
+
+    ifd1 = None
+    if next0:
+        if next0 in visited:
+            raise ValueError("IFD loop detected")
+        visited.add(next0)
+        ifd1, next1 = _read_ifd(tiff, next0, bo)
+        if next1 != 0:
+            raise ValueError("IFD1 must terminate")
+
+    thumb = None
+    if ifd1 is not None:
+        offset_entry = _find_entry(ifd1, THUMB_OFFSET)
+        length_entry = _find_entry(ifd1, THUMB_LENGTH)
+        if offset_entry is not None and length_entry is not None:
+            thumb_offset = _entry_int(offset_entry, bo)
+            thumb_length = _entry_int(length_entry, bo)
+            if thumb_length:
+                if (
+                    thumb_offset < 8
+                    or thumb_offset + thumb_length > len(tiff)
+                ):
+                    raise ValueError("thumbnail out of bounds")
+                thumb = tiff[thumb_offset : thumb_offset + thumb_length]
+
+    return {
+        "tiff": tiff,
+        "endian": endian,
+        "bo": bo,
+        "ifd0": ifd0,
+        "gps": gps,
+        "ifd1": ifd1,
+        "thumb": thumb,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TIFF 重建
+# ---------------------------------------------------------------------------
+
+
+def _ifd_bytes(entries: list[dict], next_offset: int, bo: str) -> bytes:
+    out = bytearray(struct.pack(bo + "H", len(entries)))
+    for entry in entries:
+        out += struct.pack(
+            bo + "HHI", entry["tag"], entry["type"], entry["count"]
+        )
+        if len(entry["raw"]) > 4:
+            out += struct.pack(bo + "I", entry["_offset"])
+        else:
+            out += entry["raw"].ljust(4, b"\x00")[:4]
+    out += struct.pack(bo + "I", next_offset)
+    return bytes(out)
+
+
+def _build(
+    ifd0: list[dict],
+    gps: list[dict] | None,
+    ifd1: list[dict] | None,
+    thumb: bytes | None,
+    bo: str,
+) -> bytes:
+    """按稳定顺序重建 TIFF 数据区并重写全部偏移。"""
+
+    include_gps = gps is not None and _find_entry(ifd0, GPS_INFO) is not None
+    if not include_gps:
+        gps = None
+
+    has_thumb = (
+        ifd1 is not None
+        and thumb is not None
+        and _find_entry(ifd1, THUMB_OFFSET) is not None
+        and _find_entry(ifd1, THUMB_LENGTH) is not None
+    )
+    if not has_thumb:
+        thumb = None
+
+    # 指针标签统一为单个 LONG，稍后写入真实值。
+    for entries in (ifd0, gps, ifd1):
+        if not entries:
+            continue
+        for entry in entries:
+            if entry["tag"] in _POINTER_TAGS:
+                entry["type"] = TYPE_LONG
+                entry["count"] = 1
+                entry["raw"] = b"\x00\x00\x00\x00"
+
+    ifd0_size = 2 + 12 * len(ifd0) + 4
+    gps_size = 2 + 12 * len(gps) + 4 if gps is not None else 0
+    ifd1_size = 2 + 12 * len(ifd1) + 4 if ifd1 is not None else 0
+
+    ifd0_offset = 8
+    gps_offset = ifd0_offset + ifd0_size if gps is not None else 0
+    ifd1_offset = ifd0_offset + ifd0_size + gps_size if ifd1 is not None else 0
+    cursor = ifd0_offset + ifd0_size + gps_size + ifd1_size
+
+    blocks: list[dict] = []
+    for entries in (ifd0, gps, ifd1):
+        if not entries:
+            continue
+        for entry in entries:
+            if len(entry["raw"]) > 4:
+                cursor = _align2(cursor)
+                entry["_offset"] = cursor
+                blocks.append(entry)
+                cursor += len(entry["raw"])
+
+    thumb_offset = 0
+    if thumb is not None:
+        thumb_offset = _align2(cursor)
+        cursor += len(thumb)
+
+    for entry in ifd0:
+        if entry["tag"] == GPS_INFO:
+            entry["raw"] = struct.pack(bo + "I", gps_offset)
+
+    if ifd1 is not None:
+        for entry in ifd1:
+            if entry["tag"] == THUMB_OFFSET:
+                entry["raw"] = struct.pack(bo + "I", thumb_offset)
+            elif entry["tag"] == THUMB_LENGTH:
+                entry["raw"] = struct.pack(
+                    bo + "I", len(thumb) if thumb is not None else 0
+                )
+
+    out = bytearray(b"MM" if bo == ">" else b"II")
+    out += struct.pack(bo + "H", 42)
+    out += struct.pack(bo + "I", ifd0_offset)
+    out += _ifd_bytes(ifd0, ifd1_offset if ifd1 is not None else 0, bo)
+    if gps is not None:
+        out += _ifd_bytes(gps, 0, bo)
+    if ifd1 is not None:
+        out += _ifd_bytes(ifd1, 0, bo)
+
+    for entry in blocks:
+        if len(out) > entry["_offset"]:
+            raise ValueError("overlapping TIFF data blocks")
+        out += b"\x00" * (entry["_offset"] - len(out))
+        out += entry["raw"]
+
+    if thumb is not None:
+        if len(out) > thumb_offset:
+            raise ValueError("overlapping thumbnail data")
+        out += b"\x00" * (thumb_offset - len(out))
+        out += thumb
+
+    if len(out) != cursor:
+        raise ValueError("TIFF layout length mismatch")
+    return EXIF_PREFIX + bytes(out)
+
+
+def _filter_entries(
+    entries: list[dict], drop_ids: set[int]
+) -> tuple[list[dict], bool]:
+    kept: list[dict] = []
+    removed = False
+    for entry in entries:
+        if entry["tag"] in drop_ids:
+            removed = True
+        else:
+            kept.append(entry)
+    return kept, removed
+
+
+# ---------------------------------------------------------------------------
+# 对外接口
+# ---------------------------------------------------------------------------
 
 
 def scrub_fields(payload: bytes, drop: list[str]) -> bytes:
-    """从 EXIF 载荷中按标签名删除字段，并返回结构自洽的新载荷。
+    """从 EXIF 载荷中按标签名删除字段，并返回结构自洽的新载荷。"""
 
-    payload 必须以 b"Exif\\x00\\x00" 开头并包含合法 TIFF 结构。drop 中的名称
-    区分大小写，只接受模块说明列出的标签名；未知名称忽略。IFD0、GPS IFD 与
-    IFD1 中同名标签都要删除。删除 GPS 字段后如果 GPS IFD 为空，必须同时移除
-    IFD0 的 GPSInfo 指针；删除字段后如果 IFD1 为空，则移除 IFD1。
+    if not drop:
+        return payload
+    drop_ids = {
+        TAG_IDS[name]
+        for name in drop
+        if isinstance(name, str) and name in TAG_IDS
+    }
+    if not drop_ids:
+        return payload
 
-    返回值必须继续以 b"Exif\\x00\\x00" 开头，且删除条目后要重建偏移表：
-    所有保留下来的 ASCII、SHORT、LONG、RATIONAL 数据偏移都要指向新位置，
-    不能留下指向被删条目的悬空指针，也不能把旧偏移原样复制。返回载荷必须
-    可以被独立解析，不需要调用方再补救。
+    model = _parse_exif(payload)
+    ifd0, removed = _filter_entries(model["ifd0"], drop_ids)
 
-    drop 为空时原样返回 payload。输入损坏或偏移越界时抛出 ValueError。
-    """
+    gps = model["gps"]
+    if gps is not None:
+        gps, gps_removed = _filter_entries(gps, drop_ids)
+        removed = removed or gps_removed
+        if not gps:
+            # GPS IFD 空了，必须同时移除 IFD0 的 GPSInfo 指针。
+            ifd0, _ = _filter_entries(ifd0, {GPS_INFO})
+            gps = None
+            removed = True
+        elif _find_entry(ifd0, GPS_INFO) is None:
+            gps = None
+            removed = True
 
-    raise NotImplementedError
+    ifd1 = model["ifd1"]
+    if ifd1 is not None:
+        ifd1, ifd1_removed = _filter_entries(ifd1, drop_ids)
+        removed = removed or ifd1_removed
+        if not ifd1:
+            ifd1 = None
+            removed = True
+
+    if not removed:
+        return payload
+
+    thumb = model["thumb"] if ifd1 is not None else None
+    return _build(ifd0, gps, ifd1, thumb, model["bo"])
 
 
 def drop_thumbnail(payload: bytes) -> bytes:
-    """移除 IFD1 及其内嵌缩略图，并清理所有缩略图相关偏移。
+    """移除 IFD1 及其内嵌缩略图，并清理所有缩略图相关偏移。"""
 
-    必须完成四件事：从 IFD0 断开 next IFD 指针；删除 IFD1 整张表；删除
-    JPEGInterchangeFormat 与 JPEGInterchangeFormatLength 标签；从 TIFF 数据区
-    删除缩略图字节。随后重建偏移表，任何残留偏移都不能再指向旧缩略图位置。
+    model = _parse_exif(payload)
+    if model["ifd1"] is None or model["thumb"] is None:
+        return payload
 
-    返回载荷仍以 b"Exif\\x00\\x00" 开头，其余 IFD0 和 GPS 字段保持不变且可
-    解析。没有缩略图或没有 IFD1 时原样返回 payload。输入损坏时抛出 ValueError。
-    """
+    drop_ids = {THUMB_OFFSET, THUMB_LENGTH}
+    ifd0, _ = _filter_entries(model["ifd0"], drop_ids)
+    gps = None
+    if model["gps"] is not None:
+        gps, _ = _filter_entries(model["gps"], drop_ids)
+        if not gps:
+            ifd0, _ = _filter_entries(ifd0, {GPS_INFO})
+            gps = None
 
-    raise NotImplementedError
+    return _build(ifd0, gps, None, None, model["bo"])
 
 
 def rewrite_offsets(payload: bytes) -> bytes:
-    """重建 EXIF 载荷的偏移表，删除没有引用的尾部字节。
+    """重建 EXIF 载荷的偏移表，删除没有引用的尾部字节。"""
 
-    按稳定顺序重新布局：TIFF 头、IFD0、GPS IFD、IFD1、各条目的外部数据、
-    缩略图。所有 out-of-line 数据偏移和 next IFD 指针都相对 TIFF 起点重新
-    计算；数据区按 2 字节对齐；不再被任何条目引用的字节不进入结果。
+    model = _parse_exif(payload)
+    return _build(
+        model["ifd0"],
+        model["gps"],
+        model["ifd1"],
+        model["thumb"],
+        model["bo"],
+    )
 
-    函数必须幂等：rewrite_offsets(rewrite_offsets(payload)) 与只调用一次完全
-    相同。已有缩略图要继续可读，缩略图偏移和长度必须同步更新。输入损坏、
-    偏移越界或 IFD 循环时抛出 ValueError。
 
-    payload 必须以 b"Exif\\x00\\x00" 开头。返回载荷保持该前缀。
-    """
+def _format_six(value: Fraction) -> str:
+    sign = "-" if value < 0 else ""
+    magnitude = -value if value < 0 else value
+    scaled = magnitude * 1_000_000
+    quotient, remainder = divmod(scaled.numerator, scaled.denominator)
+    if 2 * remainder >= scaled.denominator:
+        quotient += 1
+    whole, fraction = divmod(quotient, 1_000_000)
+    if quotient == 0:
+        sign = ""
+    return f"{sign}{whole}.{fraction:06d}"
 
-    raise NotImplementedError
+
+def _dms_to_fraction(values) -> Fraction:
+    total = Fraction(0)
+    for power, (numerator, denominator) in enumerate(values[:3]):
+        if denominator == 0:
+            raise ValueError("zero rational denominator")
+        total += Fraction(numerator, denominator) / (60**power)
+    return total
+
+
+def _gps_coordinate(
+    gps: list[dict], value_tag: int, ref_tag: int, bo: str
+) -> Fraction | None:
+    entry = _find_entry(gps, value_tag)
+    if entry is None:
+        return None
+    values = _decode_entry(entry, bo)
+    coordinate = _dms_to_fraction(values)
+    ref_entry = _find_entry(gps, ref_tag)
+    if ref_entry is not None and ref_entry["type"] == TYPE_ASCII:
+        reference = _decode_entry(ref_entry, bo).strip().upper()
+        if reference in ("S", "W"):
+            coordinate = -coordinate
+    return coordinate
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
 
 def verify_clean(data: bytes, forbidden: dict) -> list[str]:
-    """校验清洗后的图像是否仍含禁止内容，返回按固定顺序排列的发现列表。
+    """校验清洗后的图像是否仍含禁止内容，返回按固定顺序排列的发现列表。"""
 
-    forbidden 是字典，允许三个键，缺省视为空列表：
-        tags: 标签名字符串列表；
-        coordinates: 坐标字面量列表，每项形如 纬度,经度；
-        devices: 设备字符串列表。
+    if not isinstance(forbidden, dict):
+        raise ValueError("forbidden must be a mapping")
+    tag_names = forbidden.get("tags") or []
+    coordinate_literals = forbidden.get("coordinates") or []
+    device_values = forbidden.get("devices") or []
+    tag_set = set(tag_names)
+    coordinate_set = set(coordinate_literals)
+    device_set = set(device_values)
 
-    检查规则：
-    * tags 中的标签名只要出现在任一 EXIF 段的任一 IFD 中，就产生
-      tag:标签名。
-    * coordinates 必须从 GPSLatitude 与 GPSLongitude 的度分秒有理数精确
-      换算，容差 0。坐标字面量固定保留 6 位小数，例如 39.904200,116.407400；
-      只有换算值与字面量逐位相同时才产生 coordinate:纬度,经度。只检查标签名
-      是否存在、不比较实际坐标值的实现是不合格的。
-    * devices 与 ASCII 字段的完整值比较，必须整值相等，不能做子串匹配。
-      例如字段值 Canonical photo 不包含设备值 Canon。命中时产生
-      device:字段值。
+    segments = iter_segments(data)
+    tag_findings: list[str] = []
+    coordinate_findings: list[str] = []
+    device_findings: list[str] = []
 
-    结果先去重，再按 tags、coordinates、devices 的输入顺序排列；同一类内按
-    图像中的段顺序和 IFD 顺序排列。没有 EXIF 或没有命中时返回空列表。
-    图像损坏或 EXIF 载荷损坏时抛出 ValueError。
-    """
+    for index in find_exif(segments):
+        model = _parse_exif(segments[index]["payload"])
+        for entries in (model["ifd0"], model["gps"], model["ifd1"]):
+            if entries is None:
+                continue
+            for entry in entries:
+                name = TAG_NAMES.get(entry["tag"])
+                if name is not None and name in tag_set:
+                    tag_findings.append("tag:" + name)
+                if entry["type"] == TYPE_ASCII:
+                    value = _decode_entry(entry, model["bo"])
+                    if value in device_set:
+                        device_findings.append("device:" + value)
+        if model["gps"] is not None:
+            latitude = _gps_coordinate(
+                model["gps"], GPS_LAT, GPS_LAT_REF, model["bo"]
+            )
+            longitude = _gps_coordinate(
+                model["gps"], GPS_LON, GPS_LON_REF, model["bo"]
+            )
+            if latitude is not None and longitude is not None:
+                literal = f"{_format_six(latitude)},{_format_six(longitude)}"
+                if literal in coordinate_set:
+                    coordinate_findings.append("coordinate:" + literal)
 
-    raise NotImplementedError
+    return (
+        _dedupe(tag_findings)
+        + _dedupe(coordinate_findings)
+        + _dedupe(device_findings)
+    )
 
 
 def validate_policy(policy: dict) -> list[str]:
-    """检查清洗策略，返回问题代码列表；合法策略返回空列表。
+    """检查清洗策略，返回问题代码列表；合法策略返回空列表。"""
 
-    policy 至少包含：
-        drop: 要删除的标签名列表；
-        forbid: 传给 verify_clean 的禁止内容字典；
-        drop_thumbnail: 是否移除缩略图；
-        verify_residue: 是否在输出上执行残留校验。
+    if not isinstance(policy, dict):
+        return ["policy_not_mapping"]
 
-    必须报告以下问题，并按此固定顺序返回：
-        coordinates_not_forbidden
-            forbid.tags 没有同时包含 GPSLatitude 与 GPSLongitude。
-        thumbnail_not_removed
-            drop_thumbnail 不为 True。
-        residue_not_verified
-            verify_residue 不为 True。
+    issues: list[str] = []
 
-    policy 不是字典时返回 policy_not_mapping。字段类型明显错误时分别返回
-    drop_not_list、forbid_not_dict。不能因为策略缺少键而抛出 KeyError。
-    """
+    drop = policy.get("drop", [])
+    if "drop" in policy and not isinstance(drop, list):
+        issues.append("drop_not_list")
 
-    raise NotImplementedError
+    forbid = policy.get("forbid", {})
+    if "forbid" in policy and not isinstance(forbid, dict):
+        issues.append("forbid_not_dict")
+
+    tags = forbid.get("tags", []) if isinstance(forbid, dict) else []
+    if not (
+        isinstance(tags, list)
+        and "GPSLatitude" in tags
+        and "GPSLongitude" in tags
+    ):
+        issues.append("coordinates_not_forbidden")
+
+    if policy.get("drop_thumbnail") is not True:
+        issues.append("thumbnail_not_removed")
+
+    if policy.get("verify_residue") is not True:
+        issues.append("residue_not_verified")
+
+    return issues
+
+
+def _rebuild_image(image: bytes, segments: list[dict], payloads: list[bytes]) -> bytes:
+    endian = image[5:6].decode("ascii")
+    bo = _order(endian)
+    out = bytearray(image[:8])
+    for segment, payload in zip(segments, payloads):
+        out += struct.pack(bo + "HI", segment["marker"], len(payload))
+        out += payload
+    out += struct.pack(bo + "HI", TRAILER_MARKER, 0)
+    return bytes(out)
+
+
+def _scrub_one(
+    image: bytes,
+    drop: list[str],
+    forbid: dict,
+    remove_thumb: bool,
+    do_verify: bool,
+) -> dict:
+    segments = iter_segments(image)
+    indexes = find_exif(segments)
+    if not indexes:
+        return {"data": image, "ok": True, "errors": [], "residues": []}
+
+    exif_indexes = set(indexes)
+    payloads: list[bytes] = []
+    for index, segment in enumerate(segments):
+        payload = segment["payload"]
+        if index in exif_indexes:
+            payload = scrub_fields(payload, drop)
+            if remove_thumb:
+                payload = drop_thumbnail(payload)
+            payload = rewrite_offsets(payload)
+        payloads.append(payload)
+
+    rebuilt = _rebuild_image(image, segments, payloads)
+
+    expected_total = 8 + sum(6 + len(payload) for payload in payloads) + 6
+    mismatch = len(rebuilt) != expected_total
+    try:
+        check = iter_segments(rebuilt)
+    except ValueError:
+        mismatch = True
+        check = []
+    if len(check) != len(segments):
+        mismatch = True
+    else:
+        for got, want in zip(check, segments):
+            if got["marker"] != want["marker"]:
+                mismatch = True
+                break
+        if not mismatch:
+            for got, payload in zip(check, payloads):
+                if got["length"] != len(payload) or got["payload"] != payload:
+                    mismatch = True
+                    break
+
+    if mismatch:
+        return {
+            "data": image,
+            "ok": False,
+            "errors": ["output_length_mismatch"],
+            "residues": [],
+        }
+
+    residues = verify_clean(rebuilt, forbid) if do_verify else []
+    if residues:
+        return {
+            "data": rebuilt,
+            "ok": False,
+            "errors": [],
+            "residues": residues,
+        }
+    return {"data": rebuilt, "ok": True, "errors": [], "residues": []}
 
 
 def scrub_batch(images: dict[str, bytes], policy: dict) -> dict:
-    """批量清洗图像，每张图独立解析、独立重建，返回同键名结果字典。
+    """批量清洗图像，每张图独立解析、独立重建，返回同键名结果字典。"""
 
-    处理顺序：先调用 validate_policy；有问题立即抛出 ValueError，不处理任何
-    图像。然后对每张图重新调用 iter_segments，不能复用上一张图的段列表。
-    对 find_exif 找到的每个 EXIF 段依次执行 scrub_fields、按策略执行
-    drop_thumbnail、rewrite_offsets，再按原字节序重建整个 SEGX 容器；非 EXIF
-    段逐字节保留。没有 EXIF 的图像必须原样返回。
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("invalid policy: " + ", ".join(problems))
 
-    每个结果字典包含：
-        data: bytes，清洗后的图像；失败时为原始输入；
-        ok: bool，是否成功且没有残留；
-        errors: list[str]，失败原因，成功时为空；
-        residues: list[str]，verify_clean 的发现，未执行校验时为空。
+    drop = policy.get("drop") or []
+    forbid = policy.get("forbid") or {}
+    remove_thumb = policy.get("drop_thumbnail") is True
+    do_verify = policy.get("verify_residue") is True
 
-    重建后必须重新解析输出并核对段数、各段载荷长度和文件总长度；长度不一致
-    时返回 ok 为 False、errors 含 output_length_mismatch，不能把截断文件当作
-    成功。单张图的 ValueError 或 struct.error 只能让该图失败，错误写入该图的
-    errors，不能中止同批其他图。若残留校验发现内容，ok 为 False，residues
-    保留发现，data 仍返回已清洗版本。
-    """
-
-    raise NotImplementedError
+    results: dict[str, dict] = {}
+    for name, image in images.items():
+        try:
+            results[name] = _scrub_one(
+                image, drop, forbid, remove_thumb, do_verify
+            )
+        except (ValueError, struct.error) as exc:
+            results[name] = {
+                "data": image,
+                "ok": False,
+                "errors": [str(exc)],
+                "residues": [],
+            }
+    return results
